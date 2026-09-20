@@ -1,0 +1,72 @@
+# =============================================================================
+# 偏好对齐配置：在 SFT 出来的 LoRA 上做 DPO
+#
+# 对应讲义 docs/07-alignment.md，对应计划 Day 27–Day 29。
+#
+#   python -m src.train.dpo                  # 先构造偏好对
+#   python -m src.train.dpo_loss --verify    # 验证 loss 实现（Day 27 的验收）
+#
+# ⚠️ DPO 的第一条纪律：**SFT 没做好，不要做 DPO。**
+#    DPO 是在「模型已经会做这件事」的前提下，把它的偏好掰正。
+#    SFT 都没学会就上 DPO，等于让一个不会答题的人做题，然后告诉他哪题错了。
+# =============================================================================
+
+# ---- 基座：指向 SFT 的输出 ----
+model_name: Qwen/Qwen2.5-VL-3B-Instruct
+# 注意这里是「SFT 后的 LoRA 目录」，不是原始模型。
+# DPO 阶段要把 SFT 的 adapter 合并进去再训（否则等于从零开始）。
+sft_adapter: outputs/qwen25vl3b-cx-lora-v0
+output_dir: outputs/qwen25vl3b-cx-dpo-v0
+
+# ---- 偏好数据 ----
+# 来源 1：评测跑出来的 bad case 自动构造成偏好对
+#     python -m src.train.dpo_loss --from-badcases reports/bad_cases.jsonl
+# 来源 2：同图不同答 / 同答不同图 的对比对（治幻觉最有效）
+#     python -m src.train.dpo_loss --contrastive data/processed/clean.jsonl
+preference_file: data/processed/dpo_pairs.jsonl
+n_pairs: 2000
+
+# ---- 训练 ----
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+# ⚠️ DPO 的学习率必须比 SFT 低一个量级（1e-6 级），
+#    否则会「为对齐牺牲能力」，模型变得只会说漂亮话。
+learning_rate: 0.000005
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+max_grad_norm: 1.0
+max_length: 2048
+bf16: true
+gradient_checkpointing: true
+
+# ---- DPO 超参 ----
+# β 控制「离参考模型多远」。
+#   β 小 -> 可以跑很远，容易跑偏（reward hacking）
+#   β 大 -> 贴着参考模型，改动小但更稳
+#   0.1 是各家论文的默认值，先用它，不要一上来就调
+beta: 0.1
+# 用 cDPO（label smoothing）当偏好标签有噪声时更稳。
+# 我们的偏好对是自动构造的，天然有噪声，所以开着。
+label_smoothing: 0.0
+
+# ---- 参考模型 ----
+# DPO 需要一个冻结的参考模型算 log ratio。
+# 3B 模型下：ref 权重 6 GB + policy 1.6 GB（QLoRA）→ 24 GB 卡够。
+# 显存紧张时可以只缓存 ref 的 logps 到磁盘，但那就不能在线更新，
+# 只适合「ref 完全不动」的场景。
+use_qlora_for_policy: true
+
+# ---- 日志 ----
+logging_steps: 10
+eval_steps: 100
+save_steps: 100
+save_total_limit: 2
+report_to: tensorboard
+run_name: cx-dpo-v0
+
+# ---- 重点盯的指标（Day 29）----
+# 训练时除了 loss，一定要看这两个：
+#   rewards/accuracies : 模型认为 chosen 比 rejected 好的比例，应该上升
+#   rewards/margins    : chosen 和 rejected 的 reward 差，应该扩大
+#   如果 accuracies 到 1.0 但 eval 变差 -> 过拟合偏好数据，减小 epoch 或加 beta

@@ -1,0 +1,62 @@
+# =============================================================================
+# 省显存配置：Qwen2.5-VL-3B + QLoRA（4bit）
+#
+#   python -m src.train.sft_peft --config configs/sft_qlora_3b.yaml
+#
+# 什么时候用这个：
+#   · 只有 T4 / 16 GB 卡（Colab 免费档）
+#   · 想在 24 GB 卡上开更长序列或更大的 batch
+#   · 想一次性跑多个实验，挤一挤省卡
+#
+# 代价：量化会带来一点质量损失（通常 < 4bit 相比 bf16 掉 1-2 个点），
+#       而且训练速度慢 20-40%（多了解量化/反量化的开销）。
+#
+# 什么时候不要用：
+#   · 最终交付版本 —— 用 sft_lora_3b.yaml 再跑一遍
+# =============================================================================
+
+model_name: Qwen/Qwen2.5-VL-3B-Instruct
+train_file: data/processed/sft_train.jsonl
+eval_file: data/processed/sft_eval.jsonl
+output_dir: outputs/qwen25vl3b-cx-qlora-v0
+
+# ---- LoRA + 4bit 量化 ----
+use_lora: true
+qlora: true
+# QLoRA 下 r 可以给大一点，因为它本身省显存。
+# 但 r 越大越容易过拟合，数据少还是老实 r=16。
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_include_connector: true
+lora_include_vision: false
+
+# ---- 训练 ----
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 16
+learning_rate: 0.0001
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+weight_decay: 0.0
+max_grad_norm: 1.0
+# Colab T4 上建议 1024；24 GB 卡上可以 2048
+max_length: 2048
+bf16: true
+# ⚠️ T4 不支持 bf16。在 Colab 免费档跑的时候，
+#    把 bf16 改成 false，fp16 改成 true。
+#    否则会报 "bf16 not supported" 或者直接出 NaN。
+# bf16: false
+# fp16: true
+gradient_checkpointing: true
+optim: paged_adamw_8bit
+seed: 42
+
+# ---- 日志与保存 ----
+logging_steps: 10
+eval_steps: 100
+save_steps: 100
+save_total_limit: 2
+report_to: tensorboard
+run_name: cx-qlora-v0

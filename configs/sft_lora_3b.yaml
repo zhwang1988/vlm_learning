@@ -1,0 +1,69 @@
+# =============================================================================
+# 主训练配置：Qwen2.5-VL-3B + LoRA（bf16）
+#
+#   python -m src.train.sft_peft --config configs/sft_lora_3b.yaml --dry-run
+#   python -m src.train.sft_peft --config configs/sft_lora_3b.yaml
+#
+# 键名必须和 src/train/sft_peft.py 里的 TrainConfig 字段一一对应
+# （脚本用 hasattr 过滤，写错的名字会被静默忽略 —— 改完记得 --dry-run 看一眼）
+#
+# 这是「默认路径」：24 GB 卡能跑，质量比 QLoRA 好。
+# 如果你的卡只有 16 GB，或者想省显存，用 configs/sft_qlora_3b.yaml
+# =============================================================================
+
+# ---- 模型与数据 ----
+model_name: Qwen/Qwen2.5-VL-3B-Instruct
+train_file: data/processed/sft_train.jsonl
+eval_file: data/processed/sft_eval.jsonl
+output_dir: outputs/qwen25vl3b-cx-lora-v0
+
+# ---- LoRA ----
+use_lora: true
+qlora: false
+lora_r: 16
+# alpha / r = 2 是常用起点。alpha 越大，LoRA 的影响越强，
+# 也越容易过拟合小数据集。数据 < 2000 条时把 r 降到 8。
+lora_alpha: 32
+lora_dropout: 0.05
+# 关键：连接器（merger.mlp）必须训。
+# 预训练的 connector 是为「通用图片描述」对齐的，
+# 电商图（白底、局部特写、瑕疵照）分布完全不同。
+# 只训 LLM 不训 connector，模型会「看错」东西。
+lora_include_connector: true
+# 视觉塔保持冻结。解冻它显存翻倍、容易灾难性遗忘，收益极小。
+lora_include_vision: false
+
+# ---- 训练 ----
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+# 有效 batch = 1 * 16 = 16。显存不够就加这个，不要减 batch（多模态下 batch>1
+# 会因为图片尺寸不一导致 padding 浪费，反而更慢）
+gradient_accumulation_steps: 16
+# LoRA 的学习率比全参高一个量级（全参一般 1e-5 ~ 2e-5）
+learning_rate: 0.0001
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+weight_decay: 0.0
+max_grad_norm: 1.0
+# 4096 是上限而不是目标。视觉 token 很占位置：
+# 一张 1024² 图 ≈ 1369 token，所以「2 张图 + 一段长对话」就可能顶满 4096。
+# 显存不够时先降到 2048，同时把 max_pixels 也降下来。
+max_length: 4096
+# 4090/5090/A800 支持 bf16。
+# T4/V100 不支持 —— 那些卡上改成 bf16: false, fp16: true
+bf16: true
+# 必须开。关掉的话激活值会随序列长度平方增长，4096 序列直接 OOM。
+# 注意：gradient_checkpointing 与 use_cache 冲突，代码里已自动处理。
+gradient_checkpointing: true
+optim: adamw_torch
+seed: 42
+
+# ---- 日志与保存 ----
+logging_steps: 10
+# 评测比训练慢（要跑完整个 eval set），别设太小
+eval_steps: 100
+save_steps: 100
+save_total_limit: 3
+report_to: tensorboard
+run_name: cx-sft-v0

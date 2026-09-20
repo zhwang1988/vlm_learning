@@ -1,0 +1,29 @@
+# 第 3 层｜部署时才装（Day 25 起）
+#
+# 两个部署环境：
+#   A. 本地 Mac  —— 只跑 FastAPI 壳子 + 走 API 后端（不需要 GPU）
+#        pip install fastapi "uvicorn[standard]" pydantic httpx python-multipart \
+#                    gradio psycopg[binary] pgvector python-dotenv
+#
+#   B. 云 GPU（Linux）—— 跑 vLLM
+#        pip install vllm>=0.6.3
+#      注意 vLLM 会自己拉一套匹配的 torch，装它之前先建干净虚拟环境，
+#      否则会把训练环境搞乱（这是最常见的一个坑）
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.8.0
+httpx>=0.27.0
+python-multipart>=0.0.9
+gradio>=4.44.0
+
+# Shopify App 后端
+psycopg[binary]>=3.2.0
+pgvector>=0.3.0
+python-dotenv>=1.0.1
+
+# 仅 Linux + CUDA：
+# vllm>=0.6.3
+# 量化：
+# autoawq>=0.2.6
+# auto-gptq>=0.7.1

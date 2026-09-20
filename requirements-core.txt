@@ -1,0 +1,32 @@
+# 第 1 层｜本机 CPU 就能装、能跑（Day 1–Day 10 全靠它）
+# 目标：跑通「用 API 调 VLM」+「读/改 minivlm 的纯 PyTorch 代码」
+#
+# 装完约 1.2–1.8 GB。Mac 上不要装 bitsandbytes / deepspeed / vllm。
+
+transformers>=4.49.0
+tokenizers>=0.20.0
+huggingface_hub>=0.26.0
+qwen-vl-utils>=0.0.10
+pillow>=10.3.0
+numpy>=1.26.0,<3.0.0
+accelerate>=0.34.0
+safetensors>=0.4.3
+
+# 数据工程（Day 8–Day 12）
+datasets>=2.21.0
+pyyaml>=6.0.1
+tqdm>=4.66.0
+rich>=13.7.0
+
+# 评测（Day 20–Day 24）
+scipy>=1.13.0
+matplotlib>=3.8.0
+
+# 检索（Day 34–Day 36）
+open_clip_torch>=2.26.0
+
+# 工具
+python-dotenv>=1.0.1
+httpx>=0.27.0
+pytest>=8.2.0
+jupyterlab>=4.2.0

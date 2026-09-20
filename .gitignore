@@ -1,0 +1,77 @@
+# ---- 密钥 / 环境 ----
+.env
+.env.local
+*.key
+*.pem
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+*.ipynb.bak
+notebooks/**/output/
+
+# ---- 数据（体积大，不进版本控制）----
+data/raw/
+data/processed/
+data/interim/
+*.jsonl
+*.parquet
+# 但数据集卡要留档 —— 它是可复现性的一部分
+!**/DATASET_CARD.md
+!**/EVAL_CARD.md
+
+# ---- 模型权重 / 产物 ----
+outputs/
+wandb/
+runs/
+tensorboard/
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+
+# ---- 图片（测试图除外）----
+assets/generated/
+*.jpg
+*.jpeg
+*.png
+*.webp
+!assets/samples/**
+
+# ---- 日志 / 临时 ----
+logs/
+*.log
+.demo_session_start
+.demo_pids/
+.DS_Store
+Thumbs.db
+tmp/
+scratch/
+
+# ---- 缓存 ----
+.cache/
+hf-cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 不过滤这些（重要）----
+!configs/**
+!docs/**
+!progress/**
+!src/**
+!scripts/**
+!notebooks/*.ipynb
+!PLAN.md
+!README.md

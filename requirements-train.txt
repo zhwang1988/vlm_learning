@@ -1,0 +1,25 @@
+# 第 2 层｜Colab / 云 GPU 上装（Day 14 起）
+#
+# Colab 里推荐这一行搞定（比这个文件更快，因为它会复用 Colab 预装的 torch）：
+#   %pip install -q "transformers>=4.49.0" "qwen-vl-utils>=0.0.10" \
+#       "peft>=0.13.0" "bitsandbytes>=0.43.0" "trl>=0.12.0" "accelerate>=0.34.0" \
+#       datasets safetensors
+#
+# 注意：
+#   1. 不要在 Colab 里 pip install torch —— 会把你预装的 CUDA 版换掉，然后就没有 GPU 了
+#   2. Colab 免费档是 T4（16 GB, fp16 only）：
+#        - 3B QLoRA 可以，7B QLoRA 勉强（max_length 要压到 1024）
+#        - bf16 在 T4 上不可用，必须用 fp16 + fp16=True
+#   3. Colab Pro 的 A100/L4 才能痛快跑 7B
+
+transformers>=4.49.0
+qwen-vl-utils>=0.0.10
+peft>=0.13.0
+bitsandbytes>=0.43.0
+trl>=0.12.0
+accelerate>=0.34.0
+datasets>=2.21.0
+safetensors>=0.4.3
+scipy>=1.13.0
+matplotlib>=3.8.0
+open_clip_torch>=2.26.0

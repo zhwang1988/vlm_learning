@@ -1,0 +1,142 @@
+{% comment %}
+  AI 客服前台挂件 · App Block
+  ============================
+  对应计划 Day 39。
+
+  这是 Theme App Extension 的入口。商家在主题编辑器里
+  把这个 block 拖到任意页面上即可（通常在 theme.liquid 的 body 末尾）。
+
+  用户可见行为：
+    - 右下角出现一个聊天气泡
+    - 点击展开对话面板
+    - 支持上传图片（最多 3 张）
+    - 回复流式/整段展示
+
+  技术要点：
+    - 脚本异步加载，不阻塞店铺首屏（审核要求）
+    - 体积控制在 100KB 以内（审核要求）
+    - 用 app block 而非 script tag（官方推荐，script tag 已废弃）
+{% endcomment %}
+
+<div
+  id="cx-widget-config"
+  data-shop="{{ shop.permanent_domain }}"
+  data-api="{{ block.settings.api_base | escape }}"
+  data-title="{{ block.settings.title | escape }}"
+  data-greeting="{{ block.settings.greeting | escape }}"
+  data-position="{{ block.settings.position }}"
+  data-accent="{{ block.settings.accent_color }}"
+  data-disclaimer="{{ block.settings.disclaimer | escape }}"
+  hidden
+></div>
+
+{% comment %}
+  主题编辑器里的占位提示。只在编辑模式下显示，
+  这样商家能看到 block 放在哪儿了（审核要求：block 不能是空白的）。
+{% endcomment %}
+{% if request.design_mode %}
+  <div style="
+    border:2px dashed #999; border-radius:12px; padding:20px;
+    text-align:center; color:#666; font-family:sans-serif; font-size:13px;
+    margin:16px 0; background:#fafafa;">
+    <strong style="display:block;font-size:15px;color:#333;margin-bottom:6px;">
+      AI 客服挂件已就位
+    </strong>
+    保存主题后，访客会在页面{{ block.settings.position == 'left' ? '左下' : '右下' }}角
+    看到一个聊天气泡。<br>
+    当前 API 地址：{{ block.settings.api_base }}
+  </div>
+{% endif %}
+
+<script>
+  (function () {
+    // 防止主题编辑器里重复加载
+    if (document.getElementById('cx-widget-loader')) return;
+
+    var cfg = document.getElementById('cx-widget-config');
+    if (!cfg) return;
+
+    // ⚠️ API 地址为空时不要加载（商家还没配置）
+    var api = cfg.dataset.api;
+    if (!api || api.indexOf('http') !== 0) {
+      console.warn('[CX Widget] api_base 未正确配置，挂件未加载');
+      return;
+    }
+
+    // 异步加载，不阻塞首屏（审核的性能要求）
+    var s = document.createElement('script');
+    s.id = 'cx-widget-loader';
+    s.src = api.replace(/\/$/, '') + '/widget.js?shop=' +
+            encodeURIComponent(cfg.dataset.shop);
+    s.async = true;
+    s.defer = true;
+    s.onerror = function () {
+      console.warn('[CX Widget] 挂件脚本加载失败');
+    };
+    document.body.appendChild(s);
+
+    // 把配置透传给挂件
+    window.__cxWidgetConfig = {
+      title: cfg.dataset.title,
+      greeting: cfg.dataset.greeting,
+      position: cfg.dataset.position,
+      accent: cfg.dataset.accent,
+      disclaimer: cfg.dataset.disclaimer
+    };
+  })();
+</script>
+
+{% schema %}
+{
+  "name": "AI 客服挂件",
+  "target": "body",
+  "settings": [
+    {
+      "type": "paragraph",
+      "content": "在店铺前台显示一个 AI 客服聊天入口。支持文字和图片咨询。安装后请先在 App 后台完成商品索引初始化。"
+    },
+    {
+      "type": "text",
+      "id": "api_base",
+      "label": "服务地址",
+      "info": "你的 App 部署地址，例如 https://your-app.example.com",
+      "default": ""
+    },
+    {
+      "type": "text",
+      "id": "title",
+      "label": "面板标题",
+      "default": "在线客服"
+    },
+    {
+      "type": "textarea",
+      "id": "greeting",
+      "label": "开场白",
+      "default": "您好！有任何商品问题都可以问我，也可以直接发图片给我看。"
+    },
+    {
+      "type": "select",
+      "id": "position",
+      "label": "显示位置",
+      "options": [
+        { "value": "right", "label": "右下角" },
+        { "value": "left", "label": "左下角" }
+      ],
+      "default": "right"
+    },
+    {
+      "type": "color",
+      "id": "accent_color",
+      "label": "主题色",
+      "default": "#1a1a1a"
+    },
+    {
+      "type": "text",
+      "id": "disclaimer",
+      "label": "免责声明",
+      "info": "审核要求：必须明确告知用户在与 AI 对话",
+      "default": "AI 回复可能不准确，重要事项请联系人工客服"
+    }
+  ]
+}
+{% endschema %}

@@ -1,0 +1,71 @@
+# =============================================================================
+# LLaMA-Factory 版训练配置（备选路线）
+#
+#   llamafactory-cli train configs/llamafactory_sft_3b.yaml
+#
+# 为什么仓库里有两个训练入口：
+#   LLaMA-Factory 快、稳、功能全 —— 正式跑训练用它。
+#   src/train/sft_peft.py 是「能读懂的原生实现」—— Day 17-18 读代码用它。
+#   两者产出的 adapter 格式兼容（都是 PEFT 格式），可以互相接。
+#
+# 前置：
+#   git clone https://github.com/hiyouga/LLaMA-Factory
+#   cd LLaMA-Factory && pip install -e ".[torch,metrics]"
+#   然后把下面的 dataset_dir 指向本仓库的 data/ 目录
+# =============================================================================
+
+### 模型
+model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
+trust_remote_code: true
+
+### 方法
+stage: sft
+do_train: true
+finetuning_type: lora          # 改 qlora 就是 4bit 量化
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+# Qwen2.5-VL 的 target。注意 merger 必须包含 —— 这是多模态 LoRA 的关键，
+# 漏掉它模型会「看错」（connector 是通用图文对齐的，不懂电商图）。
+lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+additional_target: merger.mlp
+
+### 数据
+dataset: cx_sft
+dataset_dir: ../data/processed
+template: qwen2_vl             # LLaMA-Factory 的 Qwen2-VL 模板
+cutoff_len: 4096
+# 多模态下不预处理图像（保持原分辨率交给 processor 动态处理），
+# 这样才符合 Qwen2.5-VL 的 native dynamic resolution
+preprocessing_num_workers: 4
+
+### 训练
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+learning_rate: 1.0e-4
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+max_grad_norm: 1.0
+bf16: true                     # T4 上改 false + fp16: true
+gradient_checkpointing: true
+optim: adamw_torch
+seed: 42
+
+### 输出
+output_dir: outputs/lf-qwen25vl3b-cx-lora-v0
+logging_steps: 10
+save_steps: 100
+save_total_limit: 3
+plot_loss: true
+report_to: tensorboard
+
+### 评测（可选，先在训练中跑一遍域内集）
+val_size: 0.05
+per_device_eval_batch_size: 1
+eval_strategy: steps
+eval_steps: 100
+
+### 导出（训完合并成完整权重，给 vLLM 用）
+# llamafactory-cli export configs/llamafactory_export.yaml
+# 或者用 CLI：--export_dir outputs/merged

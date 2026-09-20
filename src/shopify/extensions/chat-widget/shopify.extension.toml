@@ -1,0 +1,21 @@
+{
+  "name": "AI Customer Service Widget",
+  "description": "AI 客服聊天挂件，支持文字和图片咨询",
+  "version": "0.1.0",
+  "type": "theme_app_extension",
+  "extensibility": {
+    "app_blocks": [
+      {
+        "handle": "chat-widget",
+        "name": "AI 客服挂件"
+      }
+    ]
+  },
+  "settings": {
+    "api_base": {
+      "type": "text",
+      "label": "服务地址",
+      "info": "你的 App 部署地址"
+    }
+  }
+}
