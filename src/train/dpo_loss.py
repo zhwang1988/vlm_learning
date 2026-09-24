@@ -15,9 +15,32 @@ import random
 from pathlib import Path
 from typing import Optional
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+# ---------------------------------------------------------------------------
+# torch 延迟导入
+#
+# 本文件有两半：Part A 算 loss（要 torch），Part B 造偏好数据（纯文本）。
+# 造偏好数据是 W5 Day 26 的主力工作，它**不该要求你开着 GPU 机器**。
+# 所以 torch 改成按需导入：只有 Part A 的路径会触发。
+# ---------------------------------------------------------------------------
+
+torch = None
+F = None
+
+
+def _ensure_torch():
+    """按需导入 torch。Part B（造偏好数据）不会调用它。"""
+    global torch, F
+    if torch is None:
+        try:
+            import torch as _torch
+            import torch.nn.functional as _F
+        except ImportError as e:
+            raise RuntimeError(
+                "这条路径需要 PyTorch。造偏好数据（--from-badcases / --contrastive）"
+                "不需要它；跑 --verify 请在装了 torch 的环境里执行。"
+            ) from e
+        torch, F = _torch, _F
+    return torch
 
 
 # =============================================================================
@@ -34,6 +57,7 @@ def get_batch_logps(
 
     average_log_prob=True 时按 token 数归一化（SimPO 风格，抗长度偏见）。
     """
+    _ensure_torch()
     labels = labels.clone()
     mask = labels != -100
     labels[~mask] = 0                      # 避免 gather 越界
@@ -67,6 +91,7 @@ def dpo_loss(
 
     β 控制偏离 reference 的惩罚：大→保守，小→激进易崩。典型 0.1–0.5。
     """
+    _ensure_torch()
     chosen_rewards = beta * (policy_chosen_logps - ref_chosen_logps)
     rejected_rewards = beta * (policy_rejected_logps - ref_rejected_logps)
 
@@ -99,6 +124,7 @@ def verify_dpo_loss():
     print("DPO Loss 数值验证")
     print("=" * 78)
 
+    _ensure_torch()
     torch.manual_seed(0)
     B = 4
     beta = 0.1
@@ -239,9 +265,11 @@ def build_preference_from_badcases(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     written = 0
+    skipped = 0
     with open(out_path, "w", encoding="utf-8") as f:
         for r in rows:
             if not r.get("model_answer") or not r.get("reference"):
+                skipped += 1
                 continue
             record = {
                 "id": r.get("id", f"dpo_{written}"),
@@ -255,6 +283,12 @@ def build_preference_from_badcases(
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
             written += 1
 
+    if skipped:
+        print(f"⚠️  跳过 {skipped} 条：缺 model_answer 或 reference 字段")
+        print("    正确字段名是 query / model_answer / reference")
+        print("    （由 src/eval/error_analysis.py 输出；别的格式需要先转换）")
+    if written == 0 and rows:
+        print("✗ 一对都没写出来 —— 先确认这个文件是 error_analysis.py 生成的 bad_cases.jsonl")
     print(f"✓ 写出 {written} 对偏好数据 → {out_path}")
     return written
 
@@ -347,7 +381,14 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     if args.verify:
-        verify_dpo_loss()
+        try:
+            verify_dpo_loss()
+        except RuntimeError as e:
+            print(f"\n✗ {e}\n")
+            print("  → --verify 是纯数学验证，要 torch，但不需要 GPU。")
+            print("    在本地装 CPU 版即可：pip install torch --index-url "
+                  "https://download.pytorch.org/whl/cpu")
+            raise SystemExit(1)
     elif args.from_badcases:
         build_preference_from_badcases(args.from_badcases)
     elif args.contrastive:
@@ -355,4 +396,10 @@ if __name__ == "__main__":
                    Path(args.contrastive).read_text(encoding="utf-8").splitlines() if l.strip()]
         build_contrastive_pairs(samples, n_pairs=args.n_pairs)
     else:
-        verify_dpo_loss()
+        ap.print_help()
+        print("\n常用：")
+        print("  python -m src.train.dpo_loss --verify                  # 数值验证（要 torch）")
+        print("  python -m src.train.dpo_loss --from-badcases reports/bad_cases.jsonl"
+              "   # 造偏好数据（本地可跑）")
+        print("  python -m src.train.dpo_loss --contrastive data/processed/clean.jsonl"
+              "        # 对比式偏好对")

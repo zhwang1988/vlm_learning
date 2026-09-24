@@ -142,11 +142,11 @@ def reward_grounding(completion: str, visible_objects: set[str]) -> float:
 
     visible_objects 来自一个检测器/标注，是这张图里**确实有**的东西集合。
     """
-    mentioned = _extract_mentioned_objects(completion)
+    grounded, phantom = _extract_claims(completion, visible_objects)
+    mentioned = grounded | phantom
     if not mentioned:
         return 0.5               # 没提任何视觉证据，中性
-    hit = len(mentioned & visible_objects)
-    return hit / len(mentioned)
+    return len(grounded) / len(mentioned)
 
 
 def reward_hallucination_penalty(completion: str, visible_objects: set[str],
@@ -157,32 +157,82 @@ def reward_hallucination_penalty(completion: str, visible_objects: set[str],
     模型在 RL 里会发现：编造细节会稳定地降低总奖励，
     于是学会「不确定就说不确定」。
     """
-    mentioned = _extract_mentioned_objects(completion)
-    phantom = mentioned - visible_objects
+    _, phantom = _extract_claims(completion, visible_objects)
+    if not phantom:
+        return 0.0               # 显式返回 0.0，避免 -1.0 * 0 印出 "-0.00"
     return -penalty * len(phantom)
 
 
-def _extract_mentioned_objects(text: str) -> set[str]:
-    """从回复里抽出「声称看到的东西」。
+# 可直接判定的视觉属性词表（颜色 / 材质 / 图案 / 瑕疵 / 版型）。
+#
+# ⚠️ 为什么刻意**不放**「袖子 / 领口 / 下摆 / 口袋」这类通用部位词：
+#    针织衫天然有袖子，模型说一句「袖子偏长」是主观判断，不是编造实体。
+#    把部位词也算成幻觉会大面积误伤，奖励信号变得又吵又假。
+VISUAL_ATTR_WORDS: frozenset[str] = frozenset({
+    # 颜色
+    "黑色", "白色", "米白", "米白色", "灰色", "浅灰", "深灰",
+    "红色", "酒红", "粉色", "藕粉", "橙色", "黄色", "绿色", "墨绿", "军绿",
+    "蓝色", "浅蓝色", "深蓝色", "藏青", "紫色", "棕色", "卡其", "驼色",
+    "杏色", "香槟",
+    # 材质
+    "纯棉", "棉质", "亚麻", "羊毛", "羊绒", "真丝", "丝绸", "涤纶",
+    "牛仔", "皮革", "针织", "雪纺", "蕾丝", "摇粒绒", "灯芯绒",
+    # 图案 / 工艺
+    "条纹", "格子", "印花", "纯色", "波点", "刺绣", "镂空", "拼接", "扎染",
+    # 瑕疵（客服场景最关心的一类）
+    "破损", "破洞", "污渍", "线头", "起球", "褪色", "掉色", "开线",
+    "变形", "色差", "勾丝", "抽丝", "瑕疵", "污点", "霉斑",
+    # 版型 / 规格
+    "圆领", "翻领", "高领", "一字领", "方领", "立领", "V领", "v领",
+    "长袖", "短袖", "无袖", "七分袖", "泡泡袖",
+    "修身", "宽松", "紧身", "直筒", "阔腿", "中长款", "加长", "九分",
+})
 
-    简化实现：匹配「图中/图片里 + 有/是/显示 + XXX」这类句式，
-    以及颜色、材质、部位等关键词。
 
-    生产环境应该用 NER + 商品属性词表。这里做最小可用的版本。
+def _extract_claims(text: str, visible_objects) -> tuple[set[str], set[str]]:
+    """抽出回复里的视觉断言，分成 (有据的, 编造的)。
+
+    判定规则：
+      ① visible_objects 里已知的物体被原文提到 → 有据（并且把这段文本消费掉，
+         避免它又被词表的子串重复判定一次）
+      ② 词表里的属性词出现在原文 → 查 visible 里有没有对应物体：
+         有 → 有据；没有 → 编造
+
+    ⚠️ 为什么要「按词长降序 + 消费掉已匹配文本」：
+       "浅蓝色" 和 "蓝色" 都在词表里。如果按集合顺序遍历，短词 "蓝色"
+       可能先把 "浅蓝色" 里的 "蓝色" 匹配走，导致 visible={"深蓝色裤"}
+       时把 "浅蓝色" 误判成有据。长词优先匹配可以先占位，短词随后就找不到了。
+
+    ⚠️ 已知局限（真实工程必须补）：
+       · 否定句会误判 —— 「这**不**是浅蓝色」会被当成提到了浅蓝色。
+         生产环境要在抽取前做一层否定/反问句过滤。
+       · 同义词没做归并 —— 「米白」和「米白色」、「破了个洞」和「破洞」。
+         生产环境应该用商品属性词表 + 同义词归一，而不是硬编码集合。
+       这里保持最小可用，是为了让奖励函数的逻辑一眼看得懂。
     """
-    patterns = [
-        r"图(?:中|片|里|上)?(?:可以)?(?:看|显示|有|是|出现)(?:到|了)?([^，。；\n]{2,12})",
-        r"从(?:图|照片)(?:上|中|里)?看[，,]?\s*(?:是|有)?([^，。；\n]{2,12})",
-    ]
-    found = set()
-    for p in patterns:
-        for m in re.finditer(p, text):
-            seg = m.group(1).strip()
-            for piece in re.split(r"[和与、,]", seg):
-                piece = piece.strip()
-                if 1 < len(piece) <= 12:
-                    found.add(piece)
-    return found
+    visible = {str(o).strip() for o in (visible_objects or set())
+               if str(o).strip()}
+    grounded: set[str] = set()
+    phantom: set[str] = set()
+
+    # ① 先在原文里找已知物体，命中就消费掉这段文本
+    remaining = text
+    for obj in sorted(visible, key=len, reverse=True):
+        if obj in remaining:
+            grounded.add(obj)
+            remaining = remaining.replace(obj, "\x00")
+
+    # ② 再用词表扫剩余文本（长词优先）
+    for w in sorted(VISUAL_ATTR_WORDS, key=len, reverse=True):
+        if w not in remaining:
+            continue
+        remaining = remaining.replace(w, "\x00")
+        if any(w in obj or obj in w for obj in visible):
+            grounded.add(w)
+        else:
+            phantom.add(w)
+
+    return grounded, phantom
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +360,33 @@ def run_tests():
     print(f"  正常回复: grounding={g_good:.2f}  hallucination={h_good:.2f}")
     print(f"  幻觉回复: grounding={g_bad:.2f}  hallucination={h_bad:.2f}")
     assert h_bad < h_good, "幻觉回复的幻觉惩罚必须更重"
+    assert g_good > g_bad, "有据回复的 grounding 必须更高"
     print("  ✓ 通过（幻觉被扣分，这是治幻觉的核心机制）")
+
+    # 4b. ⭐ 对抗样本：奖励函数最容易被「薅」的三个地方
+    #     RL 会主动去找奖励函数的漏洞，测试必须比模型先找到。
+    print(f"\n[4b] 对抗样本（奖励函数必须扛得住）")
+
+    # (a) 子串重叠：「蓝色」同时是「浅蓝色」和「深蓝色」的子串。
+    #     图中只有深蓝裤，模型却说浅蓝上衣 —— 不能因为共享「蓝色」就放行。
+    v = {"深蓝色裤"}
+    g, p = _extract_claims("从图中可以看到这是浅蓝色上衣", v)
+    print(f"    (a) visible={sorted(v)}，回复说「浅蓝色上衣」")
+    print(f"        有据={sorted(g) or '∅'}  编造={sorted(p) or '∅'}")
+    assert "浅蓝色" in p, "长词必须优先匹配，否则子串重叠会漏放幻觉"
+    assert not g, "不能因为共享子串「蓝色」就把浅蓝判成有据"
+
+    # (b) 只给建议、不给视觉证据 → 中性，不该奖也不该罚
+    neutral = "这件衣服看起来不错，建议您选 M 码"
+    g, p = _extract_claims(neutral, v)
+    assert not p, "没提视觉属性就不该判幻觉 —— 否则模型会学会闭嘴"
+    assert reward_grounding(neutral, v) == 0.5, "无证据应答应为中性 0.5"
+
+    # (c) 罗列式幻觉：一句话堆 3 个不存在的瑕疵
+    g, p = _extract_claims("图中有破洞、污渍，还起球了", {"浅蓝色上衣"})
+    print(f"    (c) 罗列 3 个假瑕疵 → 编造={sorted(p)}")
+    assert len(p) >= 3, "每个编造的属性都要独立扣分，否则堆一句只罚一次很划算"
+    print("    ✓ 三个对抗样本都被正确处置")
 
     # 拒答
     assert reward_refusal("方便告诉我您的身高体重吗", True) == 1.0

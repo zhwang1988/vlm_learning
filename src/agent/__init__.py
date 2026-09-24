@@ -58,6 +58,16 @@ agent —— 多模态客服 Agent。
 # ---------------------------------------------------------------------------
 
 _LAZY: dict[str, str] = {
+    "SessionState": ".state",
+    "Turn": ".state",
+    "VisualEvidence": ".state",
+    "extract_visual_evidence": ".state",
+    "idempotency_key": ".state",
+    "Guardrails": ".guardrails",
+    "GuardrailConfig": ".guardrails",
+    "Verdict": ".guardrails",
+    "Trace": ".tracing",
+    "Step": ".tracing",
     "AgentConfig": ".agent",
     "AgentState": ".agent",
     "CXAgent": ".agent",
@@ -114,4 +124,8 @@ __all__ = [
     "ToolResult",
     "execute_tool",
     "tools_schema",
+    "SessionState", "Turn", "VisualEvidence",
+    "extract_visual_evidence", "idempotency_key",
+    "Guardrails", "GuardrailConfig", "Verdict",
+    "Trace", "Step",
 ]

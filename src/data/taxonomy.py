@@ -183,9 +183,14 @@ def build_generation_plan() -> list[dict]:
 
     返回 [{intent, image_type, count, priority, difficulty}, ...]
     priority 越小越先做（难且量大的优先，因为风险最高）
-    """
-    from ..minivlm.processor import assign_bucket  # noqa: F401  (占位，实际不用)
 
+    ⚠️ 这里曾经有一行 `from ..minivlm.processor import assign_bucket`，
+       标着「占位，实际不用」但从没被调用过。它把 torch 拖进了整条
+       import 链，后果是：**Day 9 的数据合成在本机完全跑不起来**，
+       因为本机按设计就不装 torch。一个自己不用的 import，
+       让数据工程第 1 天就卡住 —— 这类「死 import 拖依赖」是很常见的坑，
+       `scripts/selfcheck.py` 就是为了抓这种问题。已删除。
+    """
     plan = []
     for i, (intent, img_type, count) in enumerate(spill_counts()):
         it = next(x for x in IMAGE_TYPES if x.key == img_type)
@@ -227,6 +232,102 @@ def export(path: str | Path = "data/processed/taxonomy.json"):
     return p
 
 
+def _selftest() -> int:
+    """矩阵自检。
+
+    这个自检存在的直接原因：`build_generation_plan()` 曾被一行「占位」
+    import 拖进了 torch，而它从没被任何自检覆盖过，于是「Day 9 在本机
+    跑不起来」这个故障一直没被发现。凡是**被别人 import 走**的函数，
+    都必须有自检 —— 否则它的错误只会在下游以奇怪的方式暴露。
+    """
+    import json as _json
+    import sys as _sys
+    import tempfile
+    from pathlib import Path as _Path
+
+    print("\n" + "=" * 72)
+    print("分类矩阵自检")
+    print("=" * 72)
+
+    intent_keys = [i.key for i in INTENTS]
+    image_keys = [t.key for t in IMAGE_TYPES]
+
+    # 1. 矩阵完整性：每个 intent 都要有每个 image_type 的格子
+    #    （用 get 兜底会让「漏了一格」这种错误静默通过，所以这里直接查键）
+    print(f"\n[1] 矩阵完整性  {len(intent_keys)} 意图 × {len(image_keys)} 图像类型")
+    for ik in intent_keys:
+        assert ik in TARGET_DISTRIBUTION, f"矩阵里缺少意图 {ik}"
+        missing = [mk for mk in image_keys
+                   if mk not in TARGET_DISTRIBUTION[ik]]
+        assert not missing, f"意图 {ik} 缺少图像类型格子: {missing}"
+    stray = [ik for ik in TARGET_DISTRIBUTION if ik not in intent_keys]
+    assert not stray, f"矩阵里有未定义的意图: {stray}"
+    print(f"    有效格子 {len(spill_counts())} 个 · 目标总量 {total_target():,} 条")
+    assert total_target() == sum(n for _, _, n in spill_counts())
+
+    # 2. 生成计划：这是 synth.py 真正调用的入口
+    print("\n[2] 生成计划 build_generation_plan()")
+    plan = build_generation_plan()
+    assert plan, "生成计划不能为空"
+    assert len(plan) == len(spill_counts()), \
+        f"计划条数 {len(plan)} 与有效格子数 {len(spill_counts())} 不一致"
+    assert [p["priority"] for p in plan] == list(range(1, len(plan) + 1)), \
+        "priority 必须从 1 开始连续递增"
+    counts = [p["count"] for p in plan]
+    assert counts == sorted(counts, reverse=True), "计划必须按数量降序（风险高的先做）"
+    for p in plan:
+        for f in ("priority", "intent", "intent_name", "image_type",
+                  "image_type_name", "count", "difficulty", "examples"):
+            assert f in p, f"计划项缺少字段 {f}"
+        assert p["count"] > 0, "计划里不该有 0 条的格子"
+        assert 1 <= p["difficulty"] <= 5
+    print(f"    共 {len(plan)} 项 · 首项 {plan[0]['intent_name']}"
+          f"×{plan[0]['image_type_name']} {plan[0]['count']} 条")
+
+    # 3. ⭐ 回归测试：不得把 torch 拖进来
+    #    曾经这里有一行 `from ..minivlm.processor import assign_bucket`，
+    #    让 Day 9 的数据合成在本机完全跑不起来。
+    print("\n[3] 依赖检查（数据工程必须能在无 GPU 的本机跑）")
+    polluted = [m for m in _sys.modules if m.startswith(("torch", "transformers"))]
+    if polluted:
+        # 当前进程可能被调用方污染了（比如在 jupyter 里先 import 过 torch）。
+        # 用一个干净的子进程复核，避免误报。
+        import subprocess
+        root = _Path(__file__).resolve().parents[2]
+        r = subprocess.run(
+            [_sys.executable, "-c",
+             "import sys; from src.data.taxonomy import build_generation_plan;"
+             " build_generation_plan();"
+             " print([m for m in sys.modules if m.startswith(('torch','transformers'))])"],
+            capture_output=True, text=True, cwd=root, timeout=60)
+        assert r.returncode == 0, f"子进程复核失败: {r.stderr[-400:]}"
+        assert r.stdout.strip() == "[]", f"干净进程里仍引入了: {r.stdout.strip()}"
+        print(f"    当前进程有 {len(polluted)} 个 torch 相关模块（调用方带进来的）")
+        print("    干净子进程复核: 无 —— ✓")
+    else:
+        print("    torch 相关模块: 无")
+    print("    ✓ 数据工程与模型推理解耦（这条是踩过坑的回归测试）")
+
+    # 4. 导出 → 读回
+    print("\n[4] 导出 export()")
+    with tempfile.TemporaryDirectory() as d:
+        p = _Path(d) / "taxonomy.json"
+        export(p)
+        data = _json.loads(p.read_text(encoding="utf-8"))
+        assert data["total_target"] == total_target()
+        assert len(data["intents"]) == len(INTENTS)
+        assert len(data["image_types"]) == len(IMAGE_TYPES)
+        assert data["distribution"] == TARGET_DISTRIBUTION
+        print(f"    导出 {len(data['intents'])} 意图 / "
+              f"{len(data['image_types'])} 图像类型 / "
+              f"{len(data['difficulty_tiers'])} 难度层")
+        print("    ✓ 可被 synth.py 直接消费")
+
+    print("\n" + "=" * 72)
+    print("✓ 全部通过")
+    return 0
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -254,3 +355,4 @@ if __name__ == "__main__":
         print("  1. 去真实电商平台把每个格子的真实问题抄 3-5 条，补进 taxonomy.py")
         print("  2. python -m src.data.taxonomy --export")
         print("  3. 然后才能进入 Day 9 的数据合成")
+        raise SystemExit(_selftest())

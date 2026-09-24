@@ -87,7 +87,7 @@ class MultiHeadSelfAttention(nn.Module):
         # 用 F.scaled_dot_product_attention 走 FlashAttention 内核（如果可用）
         out = F.scaled_dot_product_attention(
             q, k, v,
-            dropout_p=self.attn_drop.p if self.training else 0.0,
+            dropout_p=self.proj_drop.p if self.training else 0.0,
         )                                       # (B, H, N, Dh)
         out = out.transpose(1, 2).reshape(B, N, D)
         return self.proj_drop(self.proj(out))

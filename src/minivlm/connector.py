@@ -25,6 +25,8 @@ import torch.nn.functional as F
 # =============================================================================
 
 
+
+
 class LinearConnector(nn.Module):
     """单层线性投影。MiniGPT-4 早期版本用的就是这个。
 
@@ -44,6 +46,28 @@ class LinearConnector(nn.Module):
 # 2. MLP 连接器（本项目默认）
 # =============================================================================
 
+class MLPConnector(nn.Module):
+    def __init__(self,d_vision:int,d_llm:int,hidden:int|None=None,use_layernorm:bool=False):
+        super().__init__()
+
+        hidden = hidden or d_vision
+
+        layers:list[nn.Module] = []
+        if use_layernorm:
+            layers.append(nn.LayerNorm(d_vision))
+        layers += [
+            nn.linear(d_vision,hidden),
+            nn.GELU(),
+            nn.Linear(hidden,d_llm),
+        ]
+        self.proj = nn.Sequential(*layers)
+        self.d_vision = d_vision
+        self.d_llm = d_llm
+    def foward(self,x:torch.Tensor)->torch.Tensor:
+        return self.proj(x)
+    @property
+    def n_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
 
 class MLPConnector(nn.Module):
     """两层 MLP + GELU。LLaVA、Qwen2.5-VL、InternVL 都用这个思路。
@@ -87,7 +111,38 @@ class MLPConnector(nn.Module):
 # =============================================================================
 # 3. Perceiver Resampler
 # =============================================================================
+class PerceiverAttention(nn.Module):
+    """Perceiver 的注意力层。
 
+    和普通自注意力的关键区别：
+      - query 来自 **可学习的 latent**（长度固定 = n_query）
+      - key / value 来自 **视觉特征**（长度可变 = N_patch）
+      - 所以输出长度恒为 n_query，与输入图大小无关 ← 这就是压缩的来源
+    """
+
+    def __init__(self,dim:int,dim_head:int=64,heads:int=8):
+        super().__init__()
+        self.heads = heads
+        self.scale = dim_head**-0.5
+        inner = dim_head*heads
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.to_q = nn.Linear(dim,inner,bias=False)
+        self.to_kv = nn.Linear(dim,inner**2,bias=False)
+        self.to_out = nn.Linear(inner,dim,bias=False)
+
+    def foward(self,latents:torch.Tensor,x:torch.Tensor)->torch.Tensor:
+        q = self.to_q(self.norm_q(latents))
+        kv = self.to_kv(self.norm_kv(x))
+        k,v = kv.chunk(2,dim=-1)
+        B,M,_ = q.shape
+        N = k.shape[1]
+        q = q.reshape(B,M,self.heads,-1).transpose(1,2)
+        k = k.reshape(B,N,self.heads,-1).transpose(1,2)
+        v = v.reshape(B,N,self.heads,-1).transpose(1,2)
+        out = F.scaled_dot_product_attention(q,k,v)
+        out = out.transpose(1,2).reshape(B,M,-1)
+        return self.to_out(out)
 
 class PerceiverAttention(nn.Module):
     """Perceiver 的注意力层。

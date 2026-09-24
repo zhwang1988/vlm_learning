@@ -34,7 +34,9 @@ open docs/README.md
 # 4. 跑代码
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env      # 填你的 API key / HF token
+cp .env.example .env      # 建个空配置文件放着，现在什么都不用填。
+                          # W2 数据合成才要 API key（阿里云百炼，注册送额度），
+                          # W7 Shopify 才要 SHOPIFY_API_KEY。见 .env 里的注释。
 ```
 
 **每天的固定节奏**（3–4h）：
@@ -52,8 +54,22 @@ cp .env.example .env      # 填你的 API key / HF token
 ```
 multimodal-lab/
 ├── README.md                  # 你在这里
-├── PLAN.md                    # ⭐ 8 周总纲 + 48 天逐日任务
-├── docs/                      # ⭐ 讲义：原理 / 工程 / 业务，13 篇
+├── PLAN.md                    # ⭐ 8 周总纲（索引）：每个 Day 指向 days/ 与 notebooks/
+├── days/                      # ⭐ 每日讲义：一天一个 md（目标/读/写/跑/验收/坑）
+│   ├── README.md              #    day 索引表
+│   ├── day-05.md              #    手搭 Mini-VLM
+│   ├── day-06.md              #    完整推理复盘（M1）
+│   └── day-07.md ... day-12.md #    W2 数据工程六天
+├── notebooks/                 # ⭐ 每日操作台：一天一个 ipynb
+│   ├── day-05_minivlm_assembly.ipynb
+│   ├── day-06_full_inference_review.ipynb
+│   ├── day-07_image_preprocess.ipynb
+│   ├── day-08_taxonomy_matrix.ipynb
+│   ├── day-09_data_synthesis.ipynb
+│   ├── day-10_cleaning_dedup.ipynb
+│   ├── day-11_build_sft.ipynb
+│   └── day-12_dataset_card.ipynb
+├── docs/                      # 讲义：原理 / 工程 / 业务，13 篇
 │   ├── README.md              #    阅读顺序与索引
 │   ├── 00-orientation.md      #    技术版图：多模态到底在解决什么问题
 │   ├── 01-architecture.md     #    VLM 三大件：编码器 / 连接器 / 主干
@@ -68,6 +84,7 @@ multimodal-lab/
 │   ├── 10-agent.md            #    多模态 Agent：ReAct、工具、多模态 RAG
 │   ├── 11-shopify.md          #    Shopify App 全流程：OAuth/App Block/Billing/审核
 │   ├── 12-papers.md           #    论文精读清单（含阅读顺序和精读重点）
+│   ├── 13-hardware-and-cost.md#    云 GPU 选型、本地/云端分工、省钱策略
 │   └── glossary.md            #    术语表，随时查
 ├── src/
 │   ├── minivlm/               # 从零手搭一个能跑的最小 VLM（Week 1）
@@ -77,10 +94,11 @@ multimodal-lab/
 │   ├── serve/                 # vLLM 部署 + FastAPI 网关
 │   ├── agent/                 # 多模态客服 Agent（工具 + RAG + 循环）
 │   └── shopify/               # Shopify App 后端骨架
-├── notebooks/                 # Colab 可直接跑的 notebook
 ├── configs/                   # 训练 / 评测 / 服务配置
 ├── progress/                  # ⭐ 每日打卡 + 48 天进度总表 + 周复盘
-└── scripts/                   # 环境准备、数据下载等辅助脚本
+├── scripts/                   # 环境准备、模型下载、notebook 生成等脚本
+├── docker-compose.yml         # W7 本地一键环境（PostgreSQL+pgvector+应用）
+└── Dockerfile                 # 应用侧镜像（不含 torch，~200MB）
 ```
 
 ## 四、8 周地图（一句话版）

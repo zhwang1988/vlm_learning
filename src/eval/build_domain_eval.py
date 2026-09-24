@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import random
+import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,22 +58,45 @@ class EvalSample:
 # ---------------------------------------------------------------------------
 # L1 单图单事实：图里直接能看到
 # ---------------------------------------------------------------------------
+#
+# ⚠️ must_contain 里必须写**字面关键词**，不能写「类别描述」。
+#    判分函数 `metrics.check_must_contain` 做的是**子串匹配**：
+#        hits = [k for k in must_contain if k in answer]
+#    写「颜色类关键词」的话，字面上永远不会出现在任何回答里 →
+#    命中数恒为 0 → **这批样本对任何模型都判失败**。
+#    后果是报告上「规则通过率」偏低，看起来像「模型不行」，
+#    实际上是评测集自己坏了 —— 这类错误不会有异常、不会有告警。
+#    修完之后 `_lint_templates()` 会拦住这种写法（见文件末的自检）。
+#
+#    语义：`must_contain` 是**任一命中即通过**（不是全部要命中），
+#    所以要表达「长袖或短袖都可以」就写成 ["长袖", "短袖"]。
 
 L1_TEMPLATES = {
     "product_main": [
-        ("这件是什么颜色？", ["颜色类关键词"], []),
-        ("这个是什么款式？", ["款式类关键词"], []),
-        ("衣服上有图案吗？", ["有", "没有", "图案"], []),
-        ("这是长袖还是短袖？", ["长袖", "短袖"], []),
+        # 颜色：把店铺实际在售的颜色都列上，任一命中即可
+        ("这件是什么颜色？",
+         ["黑", "白", "米", "蓝", "灰", "驼", "红", "绿", "粉"], []),
+        ("这个是什么款式？",
+         ["圆领", "翻领", "高领", "直筒", "宽松", "紧身", "A 字", "高腰",
+          "短款", "长款", "版型", "款式"], []),
+        ("衣服上有图案吗？",
+         ["有", "没有", "图案", "纯色", "条纹", "格子", "印花", "碎花"], []),
+        ("这是长袖还是短袖？",
+         ["长袖", "短袖", "中袖", "袖子"], []),
     ],
     "size_chart": [
-        ("M 码的胸围是多少？", ["数字"], []),
-        ("L 码衣长多少厘米？", ["数字"], []),
-        ("尺码表里最大是哪个码？", ["XL", "XXL", "数字"], []),
+        ("M 码的胸围是多少？",
+         ["胸围", "cm", "厘米", "M"], []),
+        ("L 码衣长多少厘米？",
+         ["衣长", "cm", "厘米", "L"], []),
+        ("尺码表里最大是哪个码？",
+         ["XL", "XXL", "XXXL", "码"], []),
     ],
     "model_wearing": [
-        ("模特穿的是哪个尺码？", ["尺码"], []),
-        ("模特身高大概多少？", ["数字"], []),
+        ("模特穿的是哪个尺码？",
+         ["尺码", "S", "M", "L", "XL", "码"], []),
+        ("模特身高大概多少？",
+         ["身高", "cm", "厘米", "模特"], []),
     ],
 }
 
@@ -148,10 +172,22 @@ def build_eval_set(
     quotas = {"L1": int(n_target * 0.30), "L2": int(n_target * 0.35),
               "L3": int(n_target * 0.25), "L4": n_target - int(n_target * 0.90)}
 
-    # 按 image_type 分组源数据
+    # 按 image_type 分组源数据（L1 用）
     by_type: dict[str, list[dict]] = {}
     for s in source_samples:
         by_type.setdefault(s.get("image_type", "?"), []).append(s)
+
+    # ⚠️ L2 的模板是按 **intent** 分组的（「线头算质量问题吗」这类问题问的是
+    #    **话题**，不是「图是什么类型」）。所以 L2 必须查 by_intent。
+    #    早期版本给 L2 也用了 by_type，而 L2_TEMPLATES 的键是
+    #    quality_issue / color_mismatch / material 这些 intent 名 ——
+    #    它们在 image_type 里一个都不存在，`by_type.get(...)` 全返回空，
+    #    于是 **L2 整整一层恒为 0 条**。
+    #    报告上只表现为「L2: 0」一行，看上去像个正常的空桶，
+    #    实际上意味着 35% 的评测样本从来没被构造出来。
+    by_intent: dict[str, list[dict]] = {}
+    for s in source_samples:
+        by_intent.setdefault(s.get("intent", "?"), []).append(s)
 
     samples: list[EvalSample] = []
     sid = 0
@@ -178,9 +214,11 @@ def build_eval_set(
                 sid += 1
 
     # --- L2 ---
-    for img_type, tmpls in L2_TEMPLATES.items():
-        pool = by_type.get(img_type, [])
+    for intent, tmpls in L2_TEMPLATES.items():
+        pool = by_intent.get(intent, [])
         if not pool:
+            print(f"  ⚠️ L2 模板 '{intent}' 在源数据里没有对应样本，"
+                  f"该模板产出 0 条")
             continue
         per_t = max(1, quotas["L2"] // max(len(L2_TEMPLATES), 1) // max(len(tmpls), 1))
         for q, must, forbid in tmpls:
@@ -190,8 +228,8 @@ def build_eval_set(
                     query=q,
                     images=_imgs_of(src),
                     difficulty="L2",
-                    intent=src.get("intent", "?"),
-                    image_type=img_type,
+                    intent=intent,
+                    image_type=src.get("image_type", "?"),
                     must_contain=must,
                     must_not_contain=forbid,
                 ))
@@ -236,12 +274,24 @@ def build_eval_set(
             ))
             sid += 1
 
+    dist = Counter(s.difficulty for s in samples)
+
+    # ⚠️ 每个难度层都必须有样本。
+    #    L2 曾经恒为 0 条（模板按 intent 分组、却拿 image_type 去查池子），
+    #    而报告上「L2: 0」看起来只是个正常的空桶 —— 35% 的评测样本
+    #    就这样静默地没了。空层必须是**硬错误**，不能只是一行统计。
+    empty_levels = [k for k in ("L1", "L2", "L3", "L4") if dist.get(k, 0) == 0]
+    if empty_levels:
+        raise SystemExit(
+            f"✗ 这些难度层一条样本都没构造出来：{empty_levels}\n"
+            f"  常见原因：模板的分组键（intent / image_type）和源数据的字段对不上，\n"
+            f"  于是查到的候选池为空、整层被跳过。检查对应 *_TEMPLATES 的键。")
+
     # 落盘
     with open(out_path, "w", encoding="utf-8") as f:
         for s in samples:
             f.write(s.to_json() + "\n")
 
-    dist = Counter(s.difficulty for s in samples)
     stats = {
         "n_total": len(samples),
         "difficulty": dict(dist),
@@ -269,6 +319,129 @@ def _imgs_of(src: dict) -> list[str]:
         return imgs
     p = src.get("image_path")
     return [p] if p else []
+
+
+# ---------------------------------------------------------------------------
+# 模板自检
+# ---------------------------------------------------------------------------
+
+# 这些词出现在 must_contain 里就说明写的是「类别描述」而不是字面关键词。
+# 判分是子串匹配，描述性文字永远命中不了 → 该条对任何模型都判失败。
+_META_MARKERS = ("关键词", "类的词", "任意", "一个词", "相关词")
+
+
+def _lint_templates(verbose: bool = True) -> list[str]:
+    """静态检查所有模板，返回问题列表（空 = 通过）。
+
+    能拦住的问题：
+      1. `must_contain` 里写「类别描述」而不是字面关键词
+         —— 子串匹配永远命不中，样本对任何模型都判失败
+      2. `must_contain` 与 `must_not_contain` 有交集
+         —— 同一个词既要求出现又禁止出现，该条永远不可能通过
+      3. 空 query / query 过短
+    """
+    problems: list[str] = []
+
+    def check(q: str, must: list[str], forbid: list[str], where: str) -> None:
+        if not q or len(q) < 3:
+            problems.append(f"{where}: query 过短或为空：{q!r}")
+        for k in must:
+            if any(m in k for m in _META_MARKERS):
+                problems.append(
+                    f"{where}: must_contain 里是**类别描述**而不是字面关键词：{k!r}"
+                    f" —— 判分是子串匹配，这永远命不中")
+            if not k.strip():
+                problems.append(f"{where}: must_contain 里有空字符串")
+        overlap = set(must) & set(forbid)
+        if overlap:
+            problems.append(
+                f"{where}: must_contain 与 must_not_contain 有交集 {overlap}"
+                f" —— 既要求出现又禁止出现，该条不可能通过")
+
+    for t, tmpls in L1_TEMPLATES.items():
+        for q, must, forbid in tmpls:
+            check(q, must, forbid, f"L1[{t}]")
+    for t, tmpls in L2_TEMPLATES.items():
+        for q, must, forbid in tmpls:
+            check(q, must, forbid, f"L2[{t}]")
+    for i, (q, must, forbid) in enumerate(L3_TEMPLATES):
+        check(q, must, forbid, f"L3[{i}]")
+    for q, should_refuse in L4_TEMPLATES:
+        if not q or len(q) < 3:
+            problems.append(f"L4: query 过短或为空：{q!r}")
+
+    if verbose and not problems:
+        print("  ✓ 模板静态检查通过（关键词都是字面量、无自相矛盾）")
+    return problems
+
+
+def _selftest() -> int:
+    """离线自检：模板静态检查 + 端到端构造（不依赖真实图片）。"""
+    print("=" * 76)
+    print("评测集构造自检（离线，不读写真实数据）")
+    print("=" * 76)
+
+    print("\n[1] 模板静态检查 _lint_templates()")
+    probs = _lint_templates()
+    for p in probs:
+        print(f"    ✗ {p}")
+    assert not probs, f"模板有问题：{probs}"
+    print("    ✓ 无问题")
+
+    print("\n[2] check_must_contain 的语义：类别描述永远命不中")
+    from .metrics import check_must_contain
+    r = check_must_contain(
+        "从图片看这是米白色的纯棉圆领T恤，版型宽松。", ["颜色类关键词"])
+    assert not r.passed, (
+        "「颜色类关键词」不该被判通过 —— 如果通过了，说明判分做了语义匹配，"
+        "那么 must_contain 的写法约定需要重新定义")
+    r2 = check_must_contain(
+        "从图片看这是米白色的纯棉圆领T恤，版型宽松。",
+        ["黑", "米", "蓝", "圆领", "宽松"])
+    assert r2.passed, "正常回答应该命中「米」和「圆领」"
+    print(f"    类别描述 → passed={r.passed} （{r.detail[:40]}）")
+    print(f"    字面关键词 → passed={r2.passed} （{r2.detail[:40]}）")
+    print("    ✓ 修完的模板用字面关键词，能被正常回答命中")
+
+    print("\n[3] 端到端构造：每个难度层都必须非空")
+    # 造一份最小的源数据，覆盖 L1 需要的 image_type 和 L2 需要的 intent
+    src = []
+    for i, imt in enumerate(["product_main", "size_chart", "model_wearing",
+                             "detail_closeup", "defect_photo", "user_compare"]):
+        for k in range(3):
+            src.append({
+                "id": f"s{i}_{k}", "image_path": f"img_{imt}_{k}.jpg",
+                "image_type": imt,
+                "intent": ["quality_issue", "color_mismatch", "material",
+                           "size_fit", "return_refund", "logistics"][i % 6],
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "image", "path": f"img_{imt}_{k}.jpg"},
+                        {"type": "text", "text": "这个问题够长了吧"}]},
+                    {"role": "assistant", "content": [
+                        {"type": "text", "text": "这是一段足够长的示例回复内容，用于占位。"}]},
+                ],
+            })
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "eval.jsonl"
+        stats = build_eval_set(src, n_target=40, out_path=out, seed=1)
+        dist = stats["difficulty"]
+        print(f"    难度分布 {dist}")
+        for k in ("L1", "L2", "L3", "L4"):
+            assert dist.get(k, 0) > 0, (
+                f"{k} 层 0 条 —— 这一层等于没构造。"
+                f"检查 {k}_TEMPLATES 的分组键和源数据字段是否对得上")
+        # 每一条的 must_contain 都不能是类别描述
+        rows = [json.loads(l) for l in out.read_text("utf-8").splitlines() if l]
+        for r_ in rows:
+            for k in r_.get("must_contain", []):
+                assert not any(m in k for m in _META_MARKERS), \
+                    f"{r_['id']} 的 must_contain 含类别描述：{k!r}"
+        print(f"    ✓ 4 层都有样本，{len(rows)} 条的关键词全是字面量")
+
+    print("\n" + "=" * 76)
+    print("✓ 全部通过（离线）")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +558,12 @@ if __name__ == "__main__":
     ap.add_argument("--n", type=int, default=320)
     ap.add_argument("--out", default="data/eval/cx_eval_v1.jsonl")
     ap.add_argument("--card", action="store_true", help="生成评测集卡片")
+    ap.add_argument("--selftest", action="store_true",
+                    help="离线自检：模板静态检查 + 四层都非空")
     args = ap.parse_args()
+
+    if args.selftest:
+        raise SystemExit(_selftest())
 
     if args.card:
         generate_eval_card(args.out)

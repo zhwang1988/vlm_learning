@@ -91,6 +91,11 @@ class CXSample:
 # 3. Prompt 构造
 # ---------------------------------------------------------------------------
 
+# ⚠️ 这个模板会用 .format() 填充，所以模板里**每一处字面花括号都必须写成
+#    {{ 和 }}**。JSON 示例里的花括号是最容易漏的地方 —— 漏了就报
+#    `KeyError: '\n  "user_query"'` 这种看起来莫名其妙的错
+#    （Python 把整个 JSON 块当成一个占位符名字了）。
+#    改这个模板后务必跑一次：python -m src.data.synth --selftest
 SYSTEM_PROMPT = """你是一个电商客服数据生成器。你的任务是产出一条真实、自然、可用的客服对话样本。
 
 ## 硬性要求
@@ -111,12 +116,12 @@ SYSTEM_PROMPT = """你是一个电商客服数据生成器。你的任务是产�
    - 禁止过度承诺（"绝对不会有问题"）
 
 3. **输出格式**：严格输出 JSON，不要任何解释文字
-{
+{{
   "user_query": "用户的提问",
   "assistant": "客服回复",
   "need_clarification": false,
   "escalate_to_human": false
-}
+}}
 
 ## 已知商品信息
 {product_info}
@@ -352,29 +357,64 @@ class Synthesizer:
         )
         return sample
 
+    @staticmethod
+    def _resolve_intent(item: dict) -> dict:
+        for k, n, d in _iter_intents():
+            if k == item["intent"]:
+                return {"key": k, "name": n, "description": d}
+        raise KeyError(f"计划里的意图 {item['intent']} 不在 taxonomy.INTENTS 里")
+
     async def run(self, plan: list[dict], image_pool: dict[str, list[str]],
                   product_pool: list[dict], clarify_ratio: float = 0.06,
-                  escalate_ratio: float = 0.04, dry_run: bool = False):
+                  escalate_ratio: float = 0.04, dry_run: bool = False) -> int:
         """按计划批量生成。
 
         plan:          来自 taxonomy.build_generation_plan()
         image_pool:    {image_type_key: [图片路径, ...]}
         product_pool:  [商品dict, ...]
+
+        返回值 = 成功写入条数（dry-run 恒为 0）。
+
+        ⚠️ 调用方**必须**看返回值决定成败。早期版本在结尾无条件打
+           「✓ 完成，共写入 N 条」，N=0 时也这么打 —— 于是脚本和 CI 都被
+           静默骗过去，人也要翻半天日志才发现一条都没生成。
+           「生成 0 条」和「生成成功」必须能区分开。
         """
         total = sum(p["count"] for p in plan)
-        print(f"计划生成 {total:,} 条样本（含 {clarify_ratio:.0%} 澄清 + {escalate_ratio:.0%} 转人工）\n")
 
-        written = 0
+        if dry_run:
+            # dry-run 只验证「prompt 能不能拼出来」，不调模型、不写文件。
+            # 它的价值：改完 SYSTEM_PROMPT 立刻知道花括号有没有写坏
+            # （模板是用 .format() 填的，JSON 示例里的 {} 必须写成 {{}}）。
+            print(f"dry-run：只拼 prompt，不调模型、不写文件。计划 {total:,} 条\n")
+            for item in plan:
+                paths = image_pool.get(item["image_type"], [])
+                await self.generate_one(
+                    self._resolve_intent(item),
+                    {"key": item["image_type"], "name": item["image_type_name"],
+                     "description": ""},
+                    random.choice(product_pool),
+                    paths[0] if paths else "__no_image__",
+                    item["difficulty"], dry_run=True)
+            print(f"\n✓ dry-run 结束：{len(plan)} 个格子的 prompt 都拼装成功，"
+                  f"未调用模型")
+            return 0
+
+        print(f"计划生成 {total:,} 条样本"
+              f"（含 {clarify_ratio:.0%} 澄清 + {escalate_ratio:.0%} 转人工）\n")
+
+        written = failed = rejected = no_image = 0
+        errors: list[str] = []
+
         with open(self.out_path, "a", encoding="utf-8") as f:
             for item in plan:
-                intent = next(i for i in
-                              [{"key": k, "name": n, "description": d}
-                               for k, n, d in _iter_intents()] if i["key"] == item["intent"])
-                image_type = {"key": item["image_type"], "name": item["image_type_name"],
-                              "description": ""}
+                intent = self._resolve_intent(item)
+                image_type = {"key": item["image_type"],
+                              "name": item["image_type_name"], "description": ""}
                 paths = image_pool.get(item["image_type"], [])
                 if not paths:
                     print(f"⚠ 跳过 {item['intent_name']}×{item['image_type_name']}：无可用图片")
+                    no_image += 1
                     continue
 
                 n = item["count"]
@@ -393,10 +433,14 @@ class Synthesizer:
                     try:
                         sample = await self.generate_one(
                             intent, image_type, product, image_path,
-                            item["difficulty"], kinds[i], dry_run=dry_run,
+                            item["difficulty"], kinds[i], dry_run=False,
                         )
                     except Exception as e:      # noqa: BLE001
-                        print(f"  ✗ 出错: {e}")
+                        # 记下来，别只 print 一句就 continue —— 全失败时
+                        # 你需要知道错在哪，而不是只看到一个「完成」。
+                        failed += 1
+                        if len(errors) < 5:
+                            errors.append(f"{type(e).__name__}: {e}")
                         continue
 
                     if sample:
@@ -405,8 +449,38 @@ class Synthesizer:
                         written += 1
                         if written % 20 == 0:
                             print(f"    ... 已写入 {written} 条")
+                    else:
+                        rejected += 1       # 生成出来了但没过质量门 / 续跑命中
 
-        print(f"\n✓ 完成，共写入 {written} 条 → {self.out_path}")
+        # ---- 汇总：把「成功」和「没成功」分清楚 ----
+        print()
+        if errors:
+            print(f"  前 {len(errors)} 条错误：")
+            for e in errors:
+                print(f"      {e}")
+            if failed > len(errors):
+                print(f"      ... 另有 {failed - len(errors)} 条同类错误")
+
+        parts = [f"写入 {written} 条"]
+        if rejected:
+            parts.append(f"未采用 {rejected} 条")
+        if no_image:
+            parts.append(f"无图片跳过 {no_image} 格")
+        if failed:
+            parts.append(f"失败 {failed} 条")
+        line = " · ".join(parts)
+
+        if failed == 0:
+            print(f"✓ 完成：{line} → {self.out_path}")
+        elif written == 0:
+            print(f"✗ 一条都没成功：{line}")
+            print("  先看上面的报错。若是 prompt 拼不出来，检查 SYSTEM_PROMPT 里"
+                  " 的花括号有没有写成 {{}}。")
+        else:
+            ok_rate = written / max(written + failed, 1)
+            print(f"⚠ 部分失败：{line}（成功率 {ok_rate:.0%}）→ {self.out_path}")
+            print("  成功率明显偏低时不要直接拿这批数据去训 —— 先修 prompt。")
+
         return written
 
 
@@ -417,7 +491,124 @@ def _iter_intents():
 
 
 # ---------------------------------------------------------------------------
-# 7. CLI
+# 7. 自检（离线，不联网、不写文件）
+# ---------------------------------------------------------------------------
+
+
+def _selftest() -> int:
+    """离线自检。
+
+    存在的直接原因：SYSTEM_PROMPT 的 JSON 示例用了**单个花括号**，而模板是
+    用 .format() 填的 —— 于是每次生成都抛 `KeyError: '\\n  "user_query"'`，
+    而外层把异常吞掉后照样打印「✓ 完成」。两个问题凑在一起，表现为
+    「跑完说完成、文件里一条没有」，查起来很费劲。
+
+    所以这个自检同时盯住两件事：
+      ① 花括号转义 / 占位符替换（不需要联网就能测）
+      ② 质量门判定是否符合预期
+    """
+    from .taxonomy import IMAGE_TYPES, INTENTS, build_generation_plan
+
+    print("=" * 76)
+    print("数据合成自检（离线，不联网、不写文件）")
+    print("=" * 76)
+
+    def _prompt(intent, image, kind="normal", product=None):
+        return build_prompt(
+            {"key": intent.key, "name": intent.name,
+             "description": intent.description},
+            {"key": image.key, "name": image.name,
+             "description": image.description},
+            product or PRODUCT_SEED_EXAMPLE, PERSONAS[0], EMOTIONS[0],
+            image.difficulty, kind)
+
+    # 1. ⭐ 花括号转义：所有组合都要能拼出来
+    #    这是最直接的回归测试。模板里少写一个 } 就会在这里炸。
+    print(f"\n[1] prompt 拼装（{len(INTENTS)}×{len(IMAGE_TYPES)} 全组合）")
+    n = 0
+    for it in INTENTS:
+        for img in IMAGE_TYPES:
+            p = _prompt(it, img)
+            assert p and len(p) > 200, f"{it.key}×{img.key} 拼出的 prompt 太短"
+            n += 1
+    print(f"    {n} 种组合全部拼装成功")
+
+    # 2. 占位符真的被替换了
+    print("\n[2] 占位符替换")
+    p = _prompt(INTENTS[0], IMAGE_TYPES[0])
+    for token in ("{product_info}", "{persona_name}", "{emotion}",
+                  "{intent_name}", "{difficulty}", "{image_type_name}"):
+        assert token not in p, f"占位符 {token} 没被替换 —— .format() 漏了参数？"
+    assert PRODUCT_SEED_EXAMPLE["title"] in p, "商品标题没进 prompt"
+    assert PRODUCT_SEED_EXAMPLE["attributes"]["材质"] in p, \
+        "商品属性没进 prompt —— 「只能基于已知商品信息回答」的前提就没了，模型必然编造"
+    assert PERSONAS[0][0] in p, "人设没进 prompt"
+    print("    ✓ 无残留占位符，商品事实已注入")
+
+    # 3. JSON 示例的双花括号要还原成单花括号给模型看，
+    #    否则模型会照着字面的 {{ 输出，解析必挂
+    print("\n[3] 输出格式示例")
+    assert '"user_query"' in p and '"assistant"' in p, \
+        "JSON 输出示例没出现在 prompt 里"
+    assert "{{" not in p and "}}" not in p, \
+        "prompt 里残留了 {{ }} —— 转义多写了一层，模型会照抄双花括号"
+    print("    ✓ JSON 示例以正确的单花括号形式给到模型")
+
+    # 4. 三种样本类型都带上了各自的特殊要求
+    print("\n[4] 三种样本类型")
+    cases = (("normal", None), ("clarify", "主动追问"), ("escalate", "转人工"))
+    for kind, marker in cases:
+        pk = _prompt(INTENTS[0], IMAGE_TYPES[0], kind)
+        if marker:
+            assert marker in pk, f"{kind} 样本缺少特殊指令（找不到「{marker}」）"
+        else:
+            assert "本条样本的特殊要求" not in pk, "normal 样本不该带特殊指令"
+        print(f"    {kind:<9} {'带特殊指令' if marker else '无特殊指令'}")
+    print("    ✓ 澄清 / 转人工样本占比可控（见 run() 的 clarify_ratio）")
+
+    # 5. 质量门
+    print("\n[5] 质量门 validate_sample()")
+    good = {
+        "user_query": "我穿 M 码会不会太紧呀，平时穿 M 比较多",
+        "assistant": "您好，理解您担心尺码。这款 M 码肩宽 38cm、胸围 100cm，"
+                     "属于宽松直筒版型，平时穿 M 的话这件是合适的。"
+                     "如果您偏好更修身的效果，可以考虑 S 码。",
+    }
+    ok, why = validate_sample(good)
+    assert ok, f"正常样本应通过，实际被拒: {why}"
+
+    # ⚠️ 断言必须指向**预期的拒绝原因**，不能只看「被拒了」。
+    #    下面第三条一开始就是被长度检查顺手拦下的（24 字 < 25 下限），
+    #    看着「测试通过」，其实根本没测到模板化用语的过滤逻辑。
+    bads = [
+        ({"user_query": "短", "assistant": "好的什么都好说"}, "提问过短", "长度"),
+        ({"assistant": "您好，这款是纯棉的，上身很舒服，版型也宽松。" * 2},
+         "缺 user_query", "缺少字段"),
+        ({"user_query": "这个料子怎么样，会不会起球",
+          "assistant": "首先，我们来看面料，这款是 95% 棉。其次，说下版型，"
+                       "宽松直筒。再者，价格 299。综上所述，希望对您有帮助。"},
+         "模板化用语", "模板化"),
+    ]
+    for bad, hint, expect_in in bads:
+        ok2, why2 = validate_sample(bad)
+        assert not ok2, f"「{hint}」应该被质量门拦下"
+        assert expect_in in why2, f"「{hint}」被拦下的原因不对：{why2}"
+        print(f"    {hint:<12} → 拦下（{why2}）")
+    print("    ✓ 过短 / 缺字段 / 模板化用语都按预期原因拦下")
+
+    # 6. 生成计划可用（synth 的输入）
+    print("\n[6] 生成计划")
+    plan = build_generation_plan()
+    assert plan and all(p["count"] > 0 for p in plan)
+    print(f"    {len(plan)} 个格子 · 合计 {sum(p['count'] for p in plan):,} 条")
+
+    print("\n" + "=" * 76)
+    print("✓ 全部通过（离线自检，未调用任何模型）")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 8. CLI
 # ---------------------------------------------------------------------------
 
 
@@ -431,7 +622,12 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="只生成前 N 条（调试用）")
     ap.add_argument("--dry-run", action="store_true", help="只打印 prompt 不调模型")
     ap.add_argument("--sample", action="store_true", help="用内置示例商品跑一条")
+    ap.add_argument("--selftest", action="store_true",
+                    help="离线自检：prompt 拼装 + 质量门（不联网、不写文件）")
     args = ap.parse_args()
+
+    if args.selftest:
+        raise SystemExit(_selftest())
 
     plan = build_generation_plan()
     if args.limit:
@@ -472,7 +668,13 @@ def main():
         plan = [plan[0]]
         plan[0]["count"] = 1
 
-    asyncio.run(synth.run(plan, image_pool, product_pool, dry_run=args.dry_run))
+    written = asyncio.run(synth.run(plan, image_pool, product_pool,
+                                    dry_run=args.dry_run))
+
+    # ⭐ 非 dry-run 且一条都没成 → 非 0 退出码。
+    #    「跑完了」和「跑成功了」是两件事，脚本和 CI 依赖这个区分。
+    if not args.dry_run and written == 0:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

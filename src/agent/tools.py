@@ -13,6 +13,7 @@ Agent 工具：schema 定义 + 实现 + 幂等 + 结构化错误。
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import time
 from dataclasses import dataclass, field
@@ -79,18 +80,40 @@ class Tool:
 # Mock 数据层（Day 31–33 先用 mock，Day 40 换成 Shopify）
 # ---------------------------------------------------------------------------
 
+def _days_ago(n: int) -> str:
+    """返回「n 天前」的日期字符串。
+
+    ⚠️ 为什么不用硬编码日期：`check_return_eligibility` 是拿
+    `date.today()` 去和 `delivered_at` 求差的。mock 里写死 "2026-09-15"
+    的话，今天跑是 5 天（在 7 天窗口内），过一周再跑就变 12 天（超期），
+    **测试会随真实时间腐烂** —— 今天绿的测试下周自己变红，且很难查。
+    凡是「相对当前时间」的业务规则，测试数据也必须相对当前时间生成。
+    """
+    from datetime import date, timedelta
+    return (date.today() - timedelta(days=n)).isoformat()
+
+
 MOCK_ORDERS = {
+    # 未签收 → 退货资格走「请先拒收」分支
     "s_demo_1": [
         {"order_id": "SO-2024-1001", "product": "圆领宽松针织毛衣 米白 M",
          "status": "shipped", "tracking": "SF1234567890",
-         "carrier": "顺丰", "eta": "2026-09-22", "amount": 299.00,
-         "shipped_at": "2026-09-18", "delivered_at": None},
+         "carrier": "顺丰", "eta": _days_ago(-2), "amount": 299.00,
+         "shipped_at": _days_ago(6), "delivered_at": None},
     ],
+    # 3 天前签收 → 在 7 天无理由期内，eligible=True（幂等测试的样本）
     "s_demo_2": [
         {"order_id": "SO-2024-2043", "product": "高腰阔腿牛仔裤 深蓝 L",
          "status": "delivered", "tracking": "YT9876543210",
-         "carrier": "圆通", "eta": "2026-09-15", "amount": 359.00,
-         "shipped_at": "2026-09-11", "delivered_at": "2026-09-15"},
+         "carrier": "圆通", "eta": _days_ago(9), "amount": 359.00,
+         "shipped_at": _days_ago(13), "delivered_at": _days_ago(3)},
+    ],
+    # 20 天前签收 → 已超 7 天窗口，eligible=False（测「超期但质量可退」的例外条款）
+    "s_demo_3": [
+        {"order_id": "SO-2024-3077", "product": "纯棉短袖 T 恤 白 S",
+         "status": "delivered", "tracking": "JD1122334455",
+         "carrier": "京东", "eta": _days_ago(26), "amount": 129.00,
+         "shipped_at": _days_ago(30), "delivered_at": _days_ago(20)},
     ],
 }
 
@@ -113,6 +136,11 @@ RETURN_POLICY = {
 
 MOCK_RETURNS: dict[str, dict] = {}          # idempotency_key -> return record
 MOCK_IDEMPOTENCY: dict[str, ToolResult] = {}
+
+# 退货单号自增序列。
+# 不要用 int(time.time()) % 100000 —— 同一秒内两笔不同订单的退货会撞号，
+# 而「单号唯一」是后端的基本契约。生产环境应由数据库序列/雪花 ID 保证。
+_RET_SEQ = itertools.count(1)
 
 
 # ---------------------------------------------------------------------------
@@ -260,13 +288,16 @@ def start_return(session_id: str = "", order_id: str = "",
             res = ToolResult(
                 False, error_code="NOT_ELIGIBLE",
                 message=elig.data.get("reason", "不符合退货条件"),
-                suggestion=elig.data.get("exception",
-                                        "请用户说明具体问题，或转人工处理"),
+                # 优先用更具体的 exception（超期场景），其次 note（未签收场景），
+                # 最后才兜底 —— 兜底文案太笼统，模型照着说会很空。
+                suggestion=(elig.data.get("exception")
+                            or elig.data.get("note")
+                            or "请用户说明具体问题，或转人工处理"),
             )
             MOCK_IDEMPOTENCY[key] = res
             return res
 
-    rid = f"RET-{int(time.time()) % 100000:05d}"
+    rid = f"RET-{next(_RET_SEQ):05d}"
     rec = {
         "return_id": rid,
         "order_id": order_id or "SO-2024-1001",
@@ -523,21 +554,46 @@ def run_tests():
     assert r.data["available"] == 0
 
     # 4. ⭐ 幂等（Day 33 的核心验收）
+    #    先清空，避免 jupyter 里重复执行 run_tests() 时命中上一轮的缓存
+    MOCK_RETURNS.clear()
+    MOCK_IDEMPOTENCY.clear()
+
     print(f"\n[4] 幂等测试（连续调用 3 次相同的退货请求）")
     keys = set()
+    r = None
     for i in range(3):
         r = start_return("s_demo_2", "SO-2024-2043", "尺码不合适")
+        assert r.success, f"第 {i+1} 次调用失败：{r.error_code} {r.message}"
         keys.add(r.data["return_id"])
-        print(f"    第 {i+1} 次: return_id={r.data['return_id']} "
+        print(f"    第 {i+1} 次: return_id={r.data['return_id']:<14} "
               f"from_cache={r.from_cache}")
     assert len(keys) == 1, f"幂等失效！创建了 {len(keys)} 个退货单"
+    assert r.from_cache, "第 3 次必须命中缓存"
+    assert len(MOCK_RETURNS) == 1, "后端只应该落一条记录"
     print("    ✓ 三次调用只创建了一个退货单（幂等生效）")
 
-    # 5. 资格校验
+    # 5a. 未签收 → 拒
     res = start_return("s_demo_1", "SO-2024-1001", "不想要了")
-    print(f"\n[5] 未签收订单申请退货: success={res.success}")
+    print(f"\n[5a] 未签收订单申请退货: success={res.success}")
+    print(f"    error_code={res.error_code}")
     print(f"    message={res.message}")
     print(f"    suggestion={res.suggestion}")
+    assert not res.success and res.error_code == "NOT_ELIGIBLE"
+    assert res.suggestion, "拒退也必须给 suggestion，否则模型不知道怎么接话"
+
+    # 5b. 超期（非质量问题）→ 拒
+    res = start_return("s_demo_3", "SO-2024-3077", "不想要了")
+    print(f"\n[5b] 超期订单申请退货: success={res.success}")
+    print(f"    message={res.message}")
+    print(f"    suggestion={res.suggestion}")
+    assert not res.success and res.error_code == "NOT_ELIGIBLE"
+
+    # 5c. ⭐ 超期 + 质量问题 → 放行（RETURN_POLICY 里的例外条款）
+    res = start_return("s_demo_3", "SO-2024-3077", "衣服收到就有质量问题，破了个洞")
+    print(f"\n[5c] 超期但属质量问题: success={res.success}")
+    print(f"    return_id={(res.data or {}).get('return_id')}")
+    assert res.success, "质量问题不受 7 天窗口限制 —— 例外条款没生效"
+    print("    ✓ 例外条款生效（这是客服规则里最容易写错的一条）")
 
     # 6. 工具白名单
     r = execute_tool("start_return", {}, allowed=["lookup_order", "check_stock"])
